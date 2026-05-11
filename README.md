@@ -42,6 +42,34 @@ llmtmplog --tail cargo test
 llmtmplog --head --tail npm run build
 ```
 
+### Example output
+
+After `cargo clean`, running `cargo check` through `llmtmplog`:
+
+```
+$ llmtmplog --head --tail cargo check
+llmtmplog: running `cargo`
+llmtmplog: stdout & stderr redirected to /home/you/.cache/llmtmplog/20260511-172309-737498212-91313.log
+   Compiling libc v0.2.186
+    Checking option-ext v0.2.0
+    Checking dirs-sys v0.5.0
+    Checking dirs v6.0.0
+    Checking llmtmplog v0.1.0 (/home/you/devel/llmtmplog)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.69s
+   Compiling libc v0.2.186
+    Checking option-ext v0.2.0
+    Checking dirs-sys v0.5.0
+    Checking dirs v6.0.0
+    Checking llmtmplog v0.1.0 (/home/you/devel/llmtmplog)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.69s
+llmtmplog: EXIT_CODE=0
+```
+
+The `llmtmplog:` lines go to stderr; everything else (the head preview, then
+the tail preview) goes to stdout. The output here only had six lines, so head
+and tail overlap completely — on a larger build you'd see the first 50 lines,
+then the last 50.
+
 Logs land in your platform's cache directory:
 
 - Linux: `~/.cache/llmtmplog/`
