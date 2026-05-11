@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio, exit};
 use std::sync::mpsc;
 use std::thread;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 const HEAD_LINES: usize = 50;
 const TAIL_LINES: usize = 50;
@@ -36,29 +36,23 @@ fn print_help() {
 fn generate_log_path(dir: &Path) -> PathBuf {
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap();
+        .unwrap_or(Duration::ZERO);
     let secs = now.as_secs();
+    let nanos = now.subsec_nanos();
 
     // Convert to YYYYMMDD-HHMMSS (UTC)
-    let s = secs;
-    let days = s / 86400;
-    let time_of_day = s % 86400;
+    let days = secs / 86400;
+    let time_of_day = secs % 86400;
     let hours = time_of_day / 3600;
     let minutes = (time_of_day % 3600) / 60;
     let seconds = time_of_day % 60;
-
-    // Days since 1970-01-01 to Y-M-D
     let (year, month, day) = days_to_ymd(days);
 
-    // Random suffix from /dev/urandom
-    let mut rand_bytes = [0u8; 4];
-    File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut rand_bytes))
-        .expect("failed to read /dev/urandom");
-    let hex: String = rand_bytes.iter().map(|b| format!("{b:02x}")).collect();
+    // Sub-second component + pid disambiguates concurrent invocations.
+    let pid = std::process::id();
 
     dir.join(format!(
-        "{year:04}{month:02}{day:02}-{hours:02}{minutes:02}{seconds:02}-{hex}.log"
+        "{year:04}{month:02}{day:02}-{hours:02}{minutes:02}{seconds:02}-{nanos:09}-{pid}.log"
     ))
 }
 
@@ -261,6 +255,11 @@ fn main() {
     if args.is_empty() {
         print_help();
         exit(1);
+    }
+
+    if matches!(args[0].as_str(), "-h" | "--help") {
+        print_help();
+        exit(0);
     }
 
     let code = run(args);

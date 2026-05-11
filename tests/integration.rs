@@ -1,10 +1,8 @@
 use std::fs;
 use std::process::Command;
 
-fn llmtmplog_bin() -> String {
-    // cargo test builds into target/debug by default
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    format!("{manifest_dir}/target/debug/llmtmplog")
+fn llmtmplog_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_llmtmplog")
 }
 
 fn extract_log_path(stderr: &str) -> String {
