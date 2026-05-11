@@ -17,7 +17,7 @@ log file if it needs more.
 ## Install
 
 ```sh
-git clone <this repo>
+git clone https://github.com/chklauser/llmtmplog.git
 cd llmtmplog
 cargo install --path .
 ```

@@ -5,6 +5,7 @@ edition = "2024"
 description = "Wraps a CLI invocation, redirecting output to a log file and showing an optional head/tail preview — designed for LLM coding agents."
 license = "GPL-3.0-or-later"
 readme = "README.md"
+repository = "https://github.com/chklauser/llmtmplog"
 
 [dependencies]
 dirs = "6"
