@@ -3,6 +3,8 @@ use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio, exit};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, SystemTime};
@@ -11,6 +13,7 @@ const HEAD_LINES: usize = 50;
 const TAIL_LINES: usize = 50;
 const BUF_SIZE: usize = 8192;
 const MAX_LINE_DISPLAY: usize = 4096;
+const LOG_RETENTION: Duration = Duration::from_secs(24 * 3600);
 
 fn log_dir() -> PathBuf {
     dirs::cache_dir()
@@ -54,6 +57,57 @@ fn generate_log_path(dir: &Path) -> PathBuf {
     dir.join(format!(
         "{year:04}{month:02}{day:02}-{hours:02}{minutes:02}{seconds:02}-{nanos:09}-{pid}.log"
     ))
+}
+
+// Matches the filenames produced by `generate_log_path`:
+// `YYYYMMDD-HHMMSS-NNNNNNNNN-PID.log`.
+fn is_temp_log_name(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".log") else {
+        return false;
+    };
+    let parts: Vec<&str> = stem.split('-').collect();
+    if parts.len() != 4 {
+        return false;
+    }
+    let all_digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    parts[0].len() == 8
+        && all_digits(parts[0])
+        && parts[1].len() == 6
+        && all_digits(parts[1])
+        && parts[2].len() == 9
+        && all_digits(parts[2])
+        && all_digits(parts[3])
+}
+
+fn gc_sweep(dir: &Path, stop: &AtomicBool) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let Ok(entry) = entry else { continue };
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else { continue };
+        if !is_temp_log_name(name_str) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else { continue };
+        let Ok(modified) = metadata.modified() else { continue };
+        let Ok(age) = now.duration_since(modified) else { continue };
+        if age >= LOG_RETENTION {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+fn spawn_gc(dir: PathBuf) -> Arc<AtomicBool> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_for_thread = Arc::clone(&stop);
+    thread::spawn(move || gc_sweep(&dir, &stop_for_thread));
+    stop
 }
 
 fn days_to_ymd(days: u64) -> (u64, u64, u64) {
@@ -206,6 +260,9 @@ fn run(args: Vec<String>) -> i32 {
     eprintln!("llmtmplog: running `{program}`");
 
     fs::create_dir_all(&dir).expect("failed to create log directory");
+
+    let gc_stop = spawn_gc(dir.clone());
+
     let mut log_file = File::create(&log_path).expect("failed to create log file");
 
     eprintln!("llmtmplog: stdout & stderr redirected to {}", log_path.display());
@@ -246,6 +303,11 @@ fn run(args: Vec<String>) -> i32 {
     tracker.flush_tail();
 
     eprintln!("llmtmplog: EXIT_CODE={code}");
+
+    // Cooperative shutdown: ask the GC thread to stop checking new entries.
+    // We don't join — the goal is to never make the user wait for GC.
+    gc_stop.store(true, Ordering::Relaxed);
+
     code
 }
 
@@ -264,4 +326,109 @@ fn main() {
 
     let code = run(args);
     exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn temp_log_name_matches_generated_format() {
+        assert!(is_temp_log_name("20260511-172309-737498212-91313.log"));
+        assert!(is_temp_log_name("20260101-000000-000000000-1.log"));
+        assert!(is_temp_log_name("99991231-235959-999999999-4194304.log"));
+    }
+
+    #[test]
+    fn temp_log_name_rejects_other_names() {
+        assert!(!is_temp_log_name(""));
+        assert!(!is_temp_log_name("foo.log"));
+        assert!(!is_temp_log_name("notes.txt"));
+        assert!(!is_temp_log_name("20260511-172309-737498212-91313.txt"));
+        assert!(!is_temp_log_name("20260511-172309-737498212.log"));
+        assert!(!is_temp_log_name("2026051-172309-737498212-91313.log"));
+        assert!(!is_temp_log_name("20260511-17239-737498212-91313.log"));
+        assert!(!is_temp_log_name("20260511-172309-73749821-91313.log"));
+        assert!(!is_temp_log_name("20260511-172309-737498212-.log"));
+        assert!(!is_temp_log_name("20260511-172309-abcdefghi-91313.log"));
+        assert!(!is_temp_log_name("20260511-172309-737498212-91313-extra.log"));
+    }
+
+    #[test]
+    fn generated_log_name_is_recognised() {
+        let path = generate_log_path(Path::new("/tmp"));
+        let name = path.file_name().unwrap().to_str().unwrap();
+        assert!(is_temp_log_name(name), "generated name not recognised: {name}");
+    }
+
+    fn unique_test_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "llmtmplog-gc-test-{}-{}-{}",
+            tag,
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn touch(path: &Path, age: Duration) {
+        File::create(path).unwrap();
+        let mtime = SystemTime::now() - age;
+        let f = File::options().write(true).open(path).unwrap();
+        f.set_modified(mtime).unwrap();
+    }
+
+    #[test]
+    fn gc_sweep_deletes_old_temp_logs_only() {
+        let dir = unique_test_dir("sweep");
+        let old_log = dir.join("20260101-000000-000000000-1.log");
+        let fresh_log = dir.join("20260102-000000-000000000-2.log");
+        let other_old = dir.join("notes.txt");
+        let other_pattern = dir.join("not-a-log.log");
+        touch(&old_log, Duration::from_secs(25 * 3600));
+        touch(&fresh_log, Duration::from_secs(60));
+        touch(&other_old, Duration::from_secs(48 * 3600));
+        touch(&other_pattern, Duration::from_secs(48 * 3600));
+
+        gc_sweep(&dir, &AtomicBool::new(false));
+
+        assert!(!old_log.exists(), "old temp log should be deleted");
+        assert!(fresh_log.exists(), "fresh temp log should be kept");
+        assert!(other_old.exists(), "non-temp file should be kept");
+        assert!(other_pattern.exists(), "file not matching pattern should be kept");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn gc_sweep_honours_stop_flag() {
+        let dir = unique_test_dir("stop");
+        let log = dir.join("20260101-000000-000000000-1.log");
+        touch(&log, Duration::from_secs(48 * 3600));
+
+        let stop = AtomicBool::new(true);
+        gc_sweep(&dir, &stop);
+
+        assert!(log.exists(), "stopped sweep should not delete anything");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn gc_sweep_tolerates_missing_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmtmplog-gc-test-missing-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // Directory deliberately not created.
+        gc_sweep(&dir, &AtomicBool::new(false));
+    }
 }

@@ -93,11 +93,13 @@ llmtmplog --head --tail cargo check
 If flags could appear in any order, the combinatorial explosion would make
 allowlisting impractical.
 
-## TODO
+## Garbage collection
 
-- **Log garbage collection.** Logs accumulate forever in the cache directory.
-  For now, prune manually (`rm ~/.cache/llmtmplog/*.log`) or via a cron/systemd
-  timer. A built-in retention policy would be a welcome addition.
+On each run, `llmtmplog` kicks off a background sweep of the cache directory
+and deletes its own log files older than 24 hours. The sweep only touches
+files matching the wrapper's own naming pattern, errors are silently ignored,
+and the wrapper never waits for the sweep to finish — if it's still running
+when the wrapped command exits, it just stops.
 
 ## License
 
