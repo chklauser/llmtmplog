@@ -60,6 +60,7 @@ name = "llmtmplog"
 version = "0.1.0"
 dependencies = [
  "dirs",
+ "libc",
 ]
 
 [[package]]
