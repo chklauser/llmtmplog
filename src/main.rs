@@ -4,10 +4,13 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio, exit};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, SystemTime};
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 const HEAD_LINES: usize = 50;
 const TAIL_LINES: usize = 50;
@@ -232,6 +235,69 @@ fn pipe_reader(mut pipe: impl Read + Send + 'static, tx: mpsc::Sender<Vec<u8>>) 
     }
 }
 
+// Holds the pgid (== pid) of the child process group while it is running, so
+// signal handlers can forward signals to it. 0 means "no child yet" or "child
+// already reaped"; we treat any non-positive value as "do nothing".
+#[cfg(unix)]
+static CHILD_PGID: AtomicI32 = AtomicI32::new(0);
+
+#[cfg(unix)]
+extern "C" fn forward_signal(sig: libc::c_int) {
+    let pgid = CHILD_PGID.load(Ordering::SeqCst);
+    if pgid > 0 {
+        // kill() and atomic load are async-signal-safe.
+        unsafe {
+            libc::kill(-pgid, sig);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn install_signal_forwarders() {
+    let handler = forward_signal as *const () as libc::sighandler_t;
+    unsafe {
+        libc::signal(libc::SIGINT, handler);
+        libc::signal(libc::SIGTERM, handler);
+        libc::signal(libc::SIGHUP, handler);
+        libc::signal(libc::SIGQUIT, handler);
+    }
+}
+
+#[cfg(unix)]
+fn configure_child_process_group(cmd: &mut Command) {
+    unsafe {
+        cmd.pre_exec(|| {
+            // setpgid(0, 0) puts the about-to-exec process into a new process
+            // group whose id equals its pid. Done after fork, before exec, in
+            // the outer namespace — so the pgid covers any grandchildren the
+            // command later spawns (including across bwrap PID-namespace
+            // unsharing).
+            if libc::setpgid(0, 0) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn install_signal_forwarders() {}
+
+#[cfg(not(unix))]
+fn configure_child_process_group(_cmd: &mut Command) {}
+
+#[cfg(unix)]
+fn kill_process_group(pgid: i32) {
+    if pgid > 0 {
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_pgid: i32) {}
+
 fn run(args: Vec<String>) -> i32 {
     let mut show_head = false;
     let mut show_tail = false;
@@ -268,24 +334,46 @@ fn run(args: Vec<String>) -> i32 {
     eprintln!("llmtmplog: stdout & stderr redirected to {}", log_path.display());
     let _ = io::stderr().flush();
 
-    let mut child = Command::new(program)
-        .args(&cmd_args[1..])
+    let mut cmd = Command::new(program);
+    cmd.args(&cmd_args[1..])
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap_or_else(|e| {
-            eprintln!("llmtmplog: failed to spawn `{program}`: {e}");
-            exit(127);
-        });
+        .stderr(Stdio::piped());
+    configure_child_process_group(&mut cmd);
+
+    let mut child = cmd.spawn().unwrap_or_else(|e| {
+        eprintln!("llmtmplog: failed to spawn `{program}`: {e}");
+        exit(127);
+    });
 
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
+
+    // The child was placed in a new process group whose id equals its pid
+    // (see configure_child_process_group). Publish it so signal handlers can
+    // forward signals to the group, and then install the handlers.
+    let child_pid = child.id() as i32;
+    #[cfg(unix)]
+    CHILD_PGID.store(child_pid, Ordering::SeqCst);
+    install_signal_forwarders();
 
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     let tx2 = tx.clone();
 
     let t1 = thread::spawn(move || pipe_reader(stdout, tx));
     let t2 = thread::spawn(move || pipe_reader(stderr, tx2));
+
+    // Wait on the child in its own thread. Once it has exited, kill the rest
+    // of its process group with SIGKILL so any orphaned grandchildren (which
+    // inherited stdout/stderr) release the pipe, letting the readers see EOF
+    // and unblocking the drain loop below.
+    let (status_tx, status_rx) = mpsc::channel();
+    let waiter = thread::spawn(move || {
+        let status = child.wait();
+        kill_process_group(child_pid);
+        #[cfg(unix)]
+        CHILD_PGID.store(0, Ordering::SeqCst);
+        let _ = status_tx.send(status);
+    });
 
     let mut tracker = LineTracker::new(show_head, show_tail);
 
@@ -296,8 +384,9 @@ fn run(args: Vec<String>) -> i32 {
 
     t1.join().unwrap();
     t2.join().unwrap();
+    waiter.join().unwrap();
 
-    let status = child.wait().expect("failed to wait on child");
+    let status = status_rx.recv().expect("waiter thread dropped status").expect("failed to wait on child");
     let code = status.code().unwrap_or(128);
 
     tracker.flush_tail();

@@ -9,3 +9,6 @@ repository = "https://github.com/chklauser/llmtmplog"
 
 [dependencies]
 dirs = "6"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
